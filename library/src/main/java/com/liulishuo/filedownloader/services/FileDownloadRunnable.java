@@ -41,6 +41,7 @@ import com.liulishuo.filedownloader.util.FileDownloadUtils;
 
 import java.io.File;
 import java.io.FileDescriptor;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.RandomAccessFile;
@@ -53,6 +54,10 @@ import okhttp3.Headers;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
+import okio.Buffer;
+import okio.BufferedSink;
+import okio.BufferedSource;
+import okio.Okio;
 
 /**
  * The real downloading runnable, what works in the {@link FileDownloadThreadPool}.
@@ -414,53 +419,34 @@ public class FileDownloadRunnable implements Runnable {
     /**
      * @return Whether finish looper or not.
      */
-    @SuppressWarnings("SameReturnValue")
     private boolean fetch(Response response, boolean isSucceedContinue,
-                          long soFar, long total) throws Throwable {
-        // fetching datum
-        InputStream inputStream = null;
-        final RandomAccessFile accessFile = getRandomAccessFile(isSucceedContinue, total);
-        final FileDescriptor fd = accessFile.getFD();
+                          long soFar, long total) {
+
+        RandomAccessFile accessFile = null;
+        FileDescriptor fd = null;
+        BufferedSink sink = null;
+        BufferedSource source = null;
         try {
-            // Step 1, get input stream
-            inputStream = response.body().byteStream();
-            byte[] buff = new byte[BUFFER_SIZE];
-
             callbackMinIntervalBytes = calculateCallbackMinIntervalBytes(total, maxProgressCount);
+            accessFile = getRandomAccessFile(isSucceedContinue, total);
+            fd = accessFile.getFD();
+            sink = Okio.buffer(Okio.sink(new FileOutputStream(fd)));
+            Buffer buffer = sink.buffer();
+            long len;
+            source = response.body().source();
+            while ((len = source.read(buffer, BUFFER_SIZE)) != -1) {
+                sink.emitCompleteSegments();
+                soFar += len;
+                // callback on progressing
+                onProgress(soFar, total, fd);
 
-            // enter fetching loop(Step 2->6)
-            do {
-
-                // Step 2, read from input stream.
-                int byteCount = inputStream.read(buff);
-                if (byteCount == -1) {
-                    break;
-                }
-
-                // Step 3, writ to file
-                accessFile.write(buff, 0, byteCount);
-
-                // Step 4, adapter sofar
-                soFar += byteCount;
-
-                // Step 5, check whether file is changed by others
-                if (accessFile.length() < soFar) {
-                    throw new RuntimeException(
-                            FileDownloadUtils.formatString("the file was changed by others when" +
-                                    " downloading. %d %d", accessFile.length(), soFar));
-                } else {
-                    // callback on progressing
-                    onProgress(soFar, total, fd);
-                }
-
-                // Step 6, check state
+                // Step 6, check pause
                 if (checkState()) {
                     // callback on paused
                     onPause();
                     return true;
                 }
-
-            } while (true);
+            }
 
             // Step 7, adapter chunked transfer encoding
             if (total == TOTAL_VALUE_IN_CHUNKED_RESOURCE) {
@@ -474,7 +460,7 @@ public class FileDownloadRunnable implements Runnable {
                 renameTempFile();
 
                 // Step 10, remove data from DB.
-                helper.remove(mId);
+                helper.remove(getId());
 
                 // callback completed
                 onComplete(total);
@@ -484,23 +470,24 @@ public class FileDownloadRunnable implements Runnable {
                 throw new RuntimeException(
                         FileDownloadUtils.formatString("sofar[%d] not equal total[%d]", soFar, total));
             }
+        } catch (IOException e) {
+            throw new RuntimeException(e.toString());
         } finally {
-            if (inputStream != null) {
-                //noinspection ThrowFromFinallyBlock
-                inputStream.close();
-            }
-
             try {
                 if (fd != null) {
-                    //noinspection ThrowFromFinallyBlock
                     fd.sync();
                 }
-            } finally {
-                //noinspection ConstantConditions
+                if (source != null) {
+                    source.close();
+                }
+                if (sink != null) {
+                    sink.close();
+                }
                 if (accessFile != null) {
-                    //noinspection ThrowFromFinallyBlock
                     accessFile.close();
                 }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
         }
     }
